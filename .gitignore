@@ -1,0 +1,25 @@
+# Build output
+build/
+build_debug/
+*.exe
+*.o
+*.a
+
+# VS Code local settings (keep .vscode/settings.json, launch.json etc.)
+.vscode/.browse.c_cpp.db*
+.vscode/ipch/
+.vscode/c_cpp_properties.json
+
+# CMake cache files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+install_manifest.txt
+
+# doctest (downloaded by script, not committed)
+tests/doctest.h
+
+# OS files
+.DS_Store
+Thumbs.db
