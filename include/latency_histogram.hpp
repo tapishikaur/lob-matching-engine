@@ -1,6 +1,7 @@
 #pragma once
 #include <array>
 #include <cstdint>
+#include <cstdio>
 #include <iostream>
 #include <iomanip>
 #include <string>
@@ -32,33 +33,39 @@
 #endif
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Log2-bucketed latency histogram
-//  64 buckets: bucket i covers [2^i, 2^(i+1)) nanoseconds
-//  O(1) record, O(64) percentile query, zero heap allocation
+//  Log-linear latency histogram
+//  Each power of two [2^e, 2^(e+1)) is split into 8 equal sub-buckets, so a
+//  reported percentile is within 12.5% of the true value (exact below 8 ns).
+//  O(1) record, O(buckets) percentile query, zero heap allocation.
+//  Percentiles report the bucket's upper edge, clamped to the observed min/max,
+//  so a percentile can never exceed the max.
 // ─────────────────────────────────────────────────────────────────────────────
 class LatencyHistogram {
 public:
-    static constexpr int BUCKETS = 64;
+    static constexpr int SUB_BITS = 3;                  // 8 sub-buckets per power of two
+    static constexpr int SUB      = 1 << SUB_BITS;
+    static constexpr int BUCKETS  = 64 * SUB;
 
     void record(uint64_t ns) {
-        if (ns == 0) ns = 1;
-        int b = 63 - clz64(ns);
-        b = std::clamp(b, 0, BUCKETS - 1);
-        ++counts_[b];
+        ++counts_[index(ns)];
         ++total_;
         if (ns > max_ns_) max_ns_ = ns;
         if (ns < min_ns_) min_ns_ = ns;
         sum_ns_ += ns;
     }
 
+    // p in [0, 100]: the smallest recorded value v such that at least p% of samples are <= v
+    // (to the histogram's resolution).
     uint64_t percentile(double p) const {
         if (total_ == 0) return 0;
-        uint64_t target = static_cast<uint64_t>(total_ * p / 100.0);
-        uint64_t cum    = 0;
+        if (p <= 0.0)   return min_ns_;   // exact, not a bucket edge
+        if (p >= 100.0) return max_ns_;
+        uint64_t target = static_cast<uint64_t>(static_cast<double>(total_) * p / 100.0 + 0.999999);
+        target = std::clamp<uint64_t>(target, 1, total_);
+        uint64_t cum = 0;
         for (int i = 0; i < BUCKETS; ++i) {
             cum += counts_[i];
-            if (cum > target)
-                return (1ULL << i) + (i > 0 ? (1ULL << (i - 1)) : 0);
+            if (cum >= target) return std::clamp(upper_edge(i), min_ns_, max_ns_);
         }
         return max_ns_;
     }
@@ -69,7 +76,7 @@ public:
     uint64_t count()   const { return total_; }
 
     void print(const char* label = "Latency") const {
-        std::cout << "\n\u2500\u2500 " << label << " (" << total_ << " samples) \u2500\u2500\n"
+        std::cout << "\n── " << label << " (" << total_ << " samples) ──\n"
                   << "  min    : " << fmt(min_val())          << "\n"
                   << "  mean   : " << fmt(mean())             << "\n"
                   << "  p50    : " << fmt(percentile(50))     << "\n"
@@ -88,6 +95,20 @@ public:
     }
 
 private:
+    // Values below 2^SUB_BITS get a bucket each; above that, bucket = (exponent, top 3 bits after the leading 1).
+    static int index(uint64_t ns) {
+        if (ns < static_cast<uint64_t>(SUB)) return static_cast<int>(ns);
+        const int e   = 63 - clz64(ns);
+        const int sub = static_cast<int>((ns >> (e - SUB_BITS)) & (SUB - 1));
+        return e * SUB + sub;
+    }
+    static uint64_t upper_edge(int i) {
+        const int e = i / SUB, sub = i % SUB;
+        if (e < SUB_BITS) return static_cast<uint64_t>(i);   // exact small values
+        const int shift = e - SUB_BITS;
+        return ((static_cast<uint64_t>(SUB + sub + 1)) << shift) - 1;
+    }
+
     static std::string fmt(uint64_t ns) {
         char buf[32];
         if      (ns < 1'000ULL)       snprintf(buf, sizeof(buf), "%llu ns",        (unsigned long long)ns);

@@ -1,6 +1,10 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "doctest.h"
+#include "latency_histogram.hpp"
+#include "matching_engine.hpp"
 #include "order_book.hpp"
+#include "spsc_queue.hpp"
+#include <cstddef>
 #include <vector>
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -204,6 +208,78 @@ TEST_SUITE("Cancel and Modify") {
                 order2_filled = true;
         CHECK(order2_filled);
     }
+
+    TEST_CASE("Cancel in the middle of a level keeps the others in order") {
+        TestHarness h;
+        h.book.add_order(h.make_buy(1, 100000, 5));
+        h.book.add_order(h.make_buy(2, 100000, 5));
+        h.book.add_order(h.make_buy(3, 100000, 5));
+
+        CancelOrderMsg cancel;
+        cancel.order_id  = 2;
+        cancel.symbol_id = 1;
+        CHECK(h.book.cancel_order(cancel));
+        CHECK(h.bbos.back().bid_qty == 10);    // the level's total dropped by 5
+
+        h.reports.clear();
+        h.book.add_order(h.make_sell(4, 100000, 10));
+        std::vector<OrderId> filled;
+        for (auto& r : h.reports)
+            if (r.status == OrderStatus::FILLED && r.order_id != 4) filled.push_back(r.order_id);
+        CHECK(filled == std::vector<OrderId>{1, 3});
+        CHECK(h.book.best_bid() == INVALID_PRICE);
+    }
+
+    TEST_CASE("Modify without a new qty keeps only what is still open") {
+        TestHarness h;
+        h.book.add_order(h.make_buy(1, 100000, 10));
+        h.book.add_order(h.make_sell(2, 100000, 4));   // 6 left open
+
+        ModifyOrderMsg mod;
+        mod.order_id  = 1;
+        mod.symbol_id = 1;
+        mod.new_price = 99000;
+        mod.new_qty   = 0;                             // keep the quantity
+        CHECK(h.book.modify_order(mod));
+
+        CHECK(h.bbos.back().bid_price == 99000);
+        CHECK(h.bbos.back().bid_qty   == 6);           // not the original 10
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+TEST_SUITE("Memory pool") {
+
+    TEST_CASE("Orders filled on arrival give their slot back") {
+        // Many more full fills than the pool has slots: every one must still work.
+        TestHarness h;
+        const OrderId pairs = OrderBook::MAX_ORDERS + 1000;
+        std::size_t filled = 0;
+        for (OrderId i = 0; i < pairs; ++i) {
+            REQUIRE(h.book.add_order(h.make_buy (2 * i + 1, 100000, 1)));
+            REQUIRE(h.book.add_order(h.make_sell(2 * i + 2, 100000, 1)));
+            h.reports.clear();
+            h.bbos.clear();
+            ++filled;
+        }
+        CHECK(filled == pairs);
+        CHECK(h.book.best_bid() == INVALID_PRICE);
+        CHECK(h.book.best_ask() == INVALID_PRICE);
+    }
+
+    TEST_CASE("A full pool refuses new orders instead of crashing") {
+        TestHarness h;
+        for (OrderId i = 1; i <= OrderBook::MAX_ORDERS; ++i)
+            REQUIRE(h.book.add_order(h.make_buy(i, 100000, 1)));   // all rest
+        CHECK_FALSE(h.book.add_order(h.make_buy(OrderBook::MAX_ORDERS + 1, 100000, 1)));
+
+        // Freeing one slot makes room again.
+        CancelOrderMsg cancel;
+        cancel.order_id  = 1;
+        cancel.symbol_id = 1;
+        CHECK(h.book.cancel_order(cancel));
+        CHECK(h.book.add_order(h.make_buy(OrderBook::MAX_ORDERS + 1, 100000, 1)));
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -229,7 +305,6 @@ TEST_SUITE("BBO Updates") {
 
 // ─────────────────────────────────────────────────────────────────────────────
 TEST_SUITE("SPSC Queue") {
-#include "spsc_queue.hpp"
 
     TEST_CASE("Basic push/pop") {
         SPSCQueue<int, 16> q;
@@ -253,5 +328,70 @@ TEST_SUITE("SPSC Queue") {
     TEST_CASE("Empty queue returns nullopt") {
         SPSCQueue<int, 8> q;
         CHECK_FALSE(q.pop().has_value());
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+TEST_SUITE("Latency histogram") {
+
+    TEST_CASE("Percentiles stay between min and max") {
+        LatencyHistogram h;
+        h.record(1'000);
+        h.record(9'250'000);   // in the upper half of its power-of-two range
+        CHECK(h.percentile(50)  >= h.min_val());
+        CHECK(h.percentile(99)  <= h.max_val());
+        CHECK(h.percentile(100) == h.max_val());
+        CHECK(h.percentile(0)   == h.min_val());
+    }
+
+    TEST_CASE("Percentiles are within 12.5% of the true value") {
+        LatencyHistogram h;
+        for (uint64_t v = 1; v <= 100'000; ++v) h.record(v);   // true p-th percentile = p * 1000
+        for (double p : {10.0, 50.0, 90.0, 99.0, 99.9}) {
+            const double truth = p * 1'000.0;
+            const double got   = static_cast<double>(h.percentile(p));
+            CHECK(got >= truth);           // the upper edge of the bucket holding it
+            CHECK(got <= truth * 1.125);
+        }
+    }
+
+    TEST_CASE("Small values are exact") {
+        LatencyHistogram h;
+        for (uint64_t v : {1, 2, 3, 4, 5}) h.record(v);
+        CHECK(h.percentile(20) == 1);
+        CHECK(h.percentile(60) == 3);
+        CHECK(h.percentile(100) == 5);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+TEST_SUITE("Matching engine (two threads)") {
+
+    TEST_CASE("Orders sent through the queue are all processed, in order") {
+        std::vector<ExecutionReport> reports;   // written by the matching thread only
+        MatchingEngine engine([&](const ExecutionReport& r) { reports.push_back(r); },
+                              [](const BBOUpdate&) {});
+        engine.register_symbol(1);
+        engine.start();
+
+        constexpr int N = 10'000;
+        for (int i = 0; i < N; ++i) {
+            NewOrderMsg m;
+            m.order_id  = static_cast<OrderId>(i + 1);
+            m.symbol_id = 1;
+            m.side      = i % 2 == 0 ? Side::BUY : Side::SELL;
+            m.price     = 100000;
+            m.qty       = 1;
+            while (!engine.submit_new(m)) {}
+        }
+        engine.stop();   // drains the queue, then joins: reports is safe to read now
+
+        CHECK(engine.orders_processed() == static_cast<uint64_t>(N));
+        // Every buy rests and the next sell fills it: NEW + NEW + 2 fills per pair.
+        CHECK(reports.size() == static_cast<std::size_t>(2 * N));
+        std::size_t filled = 0;
+        for (auto& r : reports)
+            if (r.status == OrderStatus::FILLED) ++filled;
+        CHECK(filled == static_cast<std::size_t>(N));
     }
 }

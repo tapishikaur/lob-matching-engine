@@ -19,6 +19,7 @@ struct Order {
     Quantity  open_qty   = 0;   // remaining unfilled quantity
     Quantity  orig_qty   = 0;
     Timestamp ts         = 0;
+    std::list<Order*>::iterator level_pos{};  // where it sits in its level, while resting
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -31,19 +32,14 @@ struct PriceLevel {
 
     void add(Order* o) {
         orders.push_back(o);
+        o->level_pos = std::prev(orders.end());
         total_qty += o->open_qty;
     }
 
-    // Remove a specific order (cancel path); O(n) but cancels are rare
-    bool remove(OrderId id) {
-        for (auto it = orders.begin(); it != orders.end(); ++it) {
-            if ((*it)->order_id == id) {
-                total_qty -= (*it)->open_qty;
-                orders.erase(it);
-                return true;
-            }
-        }
-        return false;
+    // Remove a resting order (cancel path): O(1), using its stored position
+    void remove(Order* o) {
+        total_qty -= o->open_qty;
+        orders.erase(o->level_pos);
     }
 
     bool empty() const { return orders.empty(); }
@@ -72,7 +68,8 @@ public:
     // Returns true if order was found and cancelled
     bool cancel_order(const CancelOrderMsg& msg);
 
-    // Cancel + re-enter (loses time priority if price changes)
+    // Cancel + re-enter at the back of the queue (always loses time priority).
+    // new_price 0 keeps the price; new_qty 0 keeps the quantity still open.
     bool modify_order(const ModifyOrderMsg& msg);
 
     // Accessors

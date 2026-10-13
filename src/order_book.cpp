@@ -12,6 +12,7 @@ OrderBook::OrderBook(SymbolId symbol_id, ExecCallback on_exec, BBOCallback on_bb
 bool OrderBook::add_order(const NewOrderMsg& msg) {
     if (msg.qty == 0) return false;
     if (order_index_.count(msg.order_id)) return false;
+    if (!pool_.available()) return false;   // every slot holds a resting order: refuse, don't crash
 
     Order* o = pool_.allocate();
     o->order_id   = msg.order_id;
@@ -54,7 +55,11 @@ bool OrderBook::add_order(const NewOrderMsg& msg) {
     Quantity leaves = match(o, exec_ts);
 
     if (leaves == 0) {
+        // Filled on arrival: it never rests, so free its slot now. The book still
+        // changed (resting orders were used up), so publish the new top of book.
         order_index_.erase(o->order_id);
+        pool_.deallocate(o);
+        emit_bbo(now_ns());
     } else if (o->order_type == OrderType::IOC) {
         emit_ack(o, OrderStatus::CANCELLED, now_ns());
         order_index_.erase(o->order_id);
@@ -73,18 +78,15 @@ bool OrderBook::cancel_order(const CancelOrderMsg& msg) {
 
     const Timestamp exec_ts = msg.ts ? msg.ts : now_ns();
 
+    // Every indexed order is resting on its level, so these finds always succeed.
     if (o->side == Side::BUY) {
         auto it = bids_.find(o->price);
-        if (it != bids_.end()) {
-            it->second.remove(o->order_id);
-            if (it->second.empty()) bids_.erase(it);
-        }
+        it->second.remove(o);
+        if (it->second.empty()) bids_.erase(it);
     } else {
         auto it = asks_.find(o->price);
-        if (it != asks_.end()) {
-            it->second.remove(o->order_id);
-            if (it->second.empty()) asks_.erase(it);
-        }
+        it->second.remove(o);
+        if (it->second.empty()) asks_.erase(it);
     }
 
     emit_ack(o, OrderStatus::CANCELLED, exec_ts);
@@ -98,10 +100,11 @@ bool OrderBook::modify_order(const ModifyOrderMsg& msg) {
     Order* o = find_order(msg.order_id);
     if (!o) return false;
 
-    // Save side/type before cancel removes the order
+    // Save side/type before cancel removes the order. A new_qty of 0 keeps what is
+    // still open: re-entering orig_qty would bring back quantity that already traded.
     Side      saved_side = o->side;
     OrderType saved_type = o->order_type;
-    Quantity  saved_qty  = o->orig_qty;
+    Quantity  saved_qty  = o->open_qty;
     Price     saved_px   = o->price;
 
     CancelOrderMsg cancel;
